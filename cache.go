@@ -15,8 +15,10 @@
 package certmagic
 
 import (
+	"container/list"
 	"fmt"
 	weakrand "math/rand"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +59,13 @@ type Cache struct {
 	// cacheIndex is a map of SAN to cache key (cert hash)
 	cacheIndex map[string][]string
 
+	// Memory usage tracking
+	currentMemoryBytes int64
+
+	// LRU tracking for memory-aware eviction
+	lruList *list.List
+	lruMap  map[string]*list.Element
+
 	// Protects the cache and cacheIndex maps
 	mu sync.RWMutex
 
@@ -67,6 +76,107 @@ type Cache struct {
 	doneChan chan struct{}
 
 	logger *zap.Logger
+}
+
+// MemoryStats holds memory usage information for the cache
+type MemoryStats struct {
+	CertificateCount       int   `json:"certificate_count"`
+	EstimatedMemoryBytes   int64 `json:"estimated_memory_bytes"`
+	EstimatedMemoryMB      int   `json:"estimated_memory_mb"`
+	RuntimeHeapBytes       int64 `json:"runtime_heap_bytes"`
+	RuntimeHeapMB          int   `json:"runtime_heap_mb"`
+	LastGC                 int64 `json:"last_gc_ns"`
+	GCCount                int   `json:"gc_count"`
+}
+
+// GetMemoryStats returns current memory usage statistics for the cache
+func (certCache *Cache) GetMemoryStats() MemoryStats {
+	certCache.mu.RLock()
+	defer certCache.mu.RUnlock()
+
+	// Get runtime memory stats
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return MemoryStats{
+		CertificateCount:     len(certCache.cache),
+		EstimatedMemoryBytes: certCache.currentMemoryBytes,
+		EstimatedMemoryMB:    int(certCache.currentMemoryBytes / (1024 * 1024)),
+		RuntimeHeapBytes:     int64(m.HeapAlloc),
+		RuntimeHeapMB:        int(m.HeapAlloc / (1024 * 1024)),
+		LastGC:               int64(m.LastGC),
+		GCCount:              int(m.NumGC),
+	}
+}
+
+// LogMemoryStats logs current memory usage statistics
+func (certCache *Cache) LogMemoryStats() {
+	stats := certCache.GetMemoryStats()
+
+	certCache.optionsMu.RLock()
+	maxMemoryMB := certCache.options.MaxMemoryMB
+	capacity := certCache.options.Capacity
+	certCache.optionsMu.RUnlock()
+	certCache.logger.Info("cache memory statistics",
+		zap.Int("certificate_count", stats.CertificateCount),
+		zap.Int("estimated_memory_mb", stats.EstimatedMemoryMB),
+		zap.Int("runtime_heap_mb", stats.RuntimeHeapMB),
+		zap.Int("max_memory_mb", maxMemoryMB),
+		zap.Int("capacity", capacity),
+		zap.Int("gc_count", stats.GCCount))
+}
+
+// startMemoryMonitor starts a goroutine that periodically checks memory usage
+// and triggers garbage collection if memory pressure is high
+func (certCache *Cache) startMemoryMonitor(interval time.Duration) {
+	if interval <= 0 {
+		return // Memory monitoring disabled
+	}
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				// Get current memory usage
+				var m runtime.MemStats
+				runtime.ReadMemStats(&m)
+
+				// Log stats periodically (every 10 checks)
+				checkCount := int(time.Now().Unix()/int64(interval.Seconds())) % 10
+				if checkCount == 0 {
+					certCache.LogMemoryStats()
+				}
+
+				// Check if we should force garbage collection
+				// (when heap usage is high or memory pressure detected)
+				heapMB := int64(m.HeapAlloc / (1024 * 1024))
+
+				certCache.optionsMu.RLock()
+				maxMemoryMB := int64(certCache.options.MaxMemoryMB)
+				certCache.optionsMu.RUnlock()
+
+				// Force GC if heap usage is 80% of our limit or if we're over our limit
+				shouldForceGC := false
+				if maxMemoryMB > 0 {
+					shouldForceGC = heapMB >= (maxMemoryMB*8/10) || certCache.isAtMemoryLimit()
+				} else {
+					// If no limit set, force GC when heap gets very large (>1GB)
+					shouldForceGC = heapMB > 1024
+				}
+
+				if shouldForceGC {
+					certCache.logger.Debug("forcing garbage collection due to memory pressure",
+						zap.Int64("heap_mb", heapMB),
+						zap.Int64("max_memory_mb", maxMemoryMB))
+					runtime.GC()
+				}
+			case <-certCache.stopChan:
+				return
+			}
+		}
+	}()
 }
 
 // NewCache returns a new, valid Cache for efficiently
@@ -93,11 +203,14 @@ type Cache struct {
 // any locks for other processes to unblock!
 func NewCache(opts CacheOptions) *Cache {
 	c := &Cache{
-		cache:      make(map[string]Certificate),
-		cacheIndex: make(map[string][]string),
-		stopChan:   make(chan struct{}),
-		doneChan:   make(chan struct{}),
-		logger:     opts.Logger,
+		cache:              make(map[string]Certificate),
+		cacheIndex:         make(map[string][]string),
+		currentMemoryBytes: 0,
+		lruList:            list.New(),
+		lruMap:             make(map[string]*list.Element),
+		stopChan:           make(chan struct{}),
+		doneChan:           make(chan struct{}),
+		logger:             opts.Logger,
 	}
 
 	// absolutely do not allow a nil logger; panics galore
@@ -108,6 +221,9 @@ func NewCache(opts CacheOptions) *Cache {
 	c.SetOptions(opts)
 
 	go c.maintainAssets(0)
+
+	// Start memory monitoring (every 30 seconds by default)
+	c.startMemoryMonitor(30 * time.Second)
 
 	return c
 }
@@ -122,6 +238,12 @@ func (certCache *Cache) SetOptions(opts CacheOptions) {
 	}
 	if opts.Capacity < 0 {
 		opts.Capacity = 0
+	}
+	if opts.MaxMemoryMB < 0 {
+		opts.MaxMemoryMB = 0
+	}
+	if opts.EvictionPolicy == "" {
+		opts.EvictionPolicy = "lru"
 	}
 
 	// this must be set, because we cannot not
@@ -177,9 +299,18 @@ type CacheOptions struct {
 	RenewCheckInterval time.Duration
 
 	// Maximum number of certificates to allow in the cache.
-	// If reached, certificates will be randomly evicted to
-	// make room for new ones. 0 means unlimited.
+	// If reached, certificates will be evicted according to
+	// EvictionPolicy to make room for new ones. 0 means unlimited.
 	Capacity int
+
+	// Maximum memory usage in MB for certificate cache.
+	// If reached, certificates will be evicted according to
+	// EvictionPolicy. 0 means unlimited. Takes precedence over Capacity.
+	MaxMemoryMB int
+
+	// Eviction policy when cache limits are reached.
+	// "lru" (default) for Least Recently Used, "random" for random eviction.
+	EvictionPolicy string
 
 	// Set a logger to enable logging
 	Logger *zap.Logger
@@ -189,6 +320,199 @@ type CacheOptions struct {
 // valid config that should be used when managing the
 // given certificate or its assets.
 type ConfigGetter func(Certificate) (*Config, error)
+
+// estimateCertificateMemoryUsage returns an estimate of the memory
+// usage of a certificate in bytes, including all associated data.
+func estimateCertificateMemoryUsage(cert Certificate) int64 {
+	var total int64
+
+	// tls.Certificate struct overhead and DER data
+	for _, certDER := range cert.Certificate.Certificate {
+		total += int64(len(certDER))
+	}
+	if cert.Certificate.PrivateKey != nil {
+		total += 2048 // Estimate for private key
+	}
+
+	// Add significant overhead for Go data structures
+	// Real certificates in production have much more overhead due to
+	// Go runtime structures, alignment, etc.
+	total += 8192 // Base overhead per certificate
+
+	// Names slice
+	for _, name := range cert.Names {
+		total += int64(len(name)) + 16 // string overhead
+	}
+
+	// Tags slice
+	for _, tag := range cert.Tags {
+		total += int64(len(tag)) + 16 // string overhead
+	}
+
+	// OCSP response (if present)
+	if cert.ocsp != nil {
+		total += 4096 // Conservative estimate for OCSP response
+	}
+
+	// Other string fields
+	total += int64(len(cert.hash)) + 16
+	total += int64(len(cert.issuerKey)) + 16
+
+	// Struct overhead and alignment
+	total += 200
+
+	return total
+}
+
+// updateLRU updates the LRU tracking for a certificate.
+// Must be called with write lock held.
+func (certCache *Cache) updateLRU(certHash string) {
+	// Skip LRU tracking if not properly initialized (e.g., in tests)
+	if certCache.lruList == nil || certCache.lruMap == nil {
+		return
+	}
+
+	if element, exists := certCache.lruMap[certHash]; exists {
+		certCache.lruList.MoveToFront(element)
+	} else {
+		element := certCache.lruList.PushFront(certHash)
+		certCache.lruMap[certHash] = element
+	}
+}
+
+// evictLRU removes the least recently used certificate.
+// Must be called with write lock held.
+func (certCache *Cache) evictLRU() {
+	// Skip LRU eviction if not properly initialized (e.g., in tests)
+	if certCache.lruList == nil || certCache.lruMap == nil {
+		return
+	}
+
+	if certCache.lruList.Len() == 0 {
+		return
+	}
+
+	element := certCache.lruList.Back()
+	if element != nil {
+		certHash := element.Value.(string)
+		certCache.removeCertificate(certHash)
+	}
+}
+
+// evictRandom removes a random certificate (legacy behavior).
+// Must be called with write lock held.
+func (certCache *Cache) evictRandom() {
+	cacheSize := len(certCache.cache)
+	if cacheSize == 0 {
+		return
+	}
+
+	rnd := weakrand.Intn(cacheSize)
+	i := 0
+	for _, randomCert := range certCache.cache {
+		if i == rnd {
+			certCache.removeCertificate(randomCert.hash)
+			break
+		}
+		i++
+	}
+}
+
+// removeCertificate removes a certificate from cache, index, memory tracking, and LRU.
+// Must be called with write lock held.
+func (certCache *Cache) removeCertificate(certHash string) {
+	cert, exists := certCache.cache[certHash]
+	if !exists {
+		return
+	}
+
+	// Remove from main cache
+	delete(certCache.cache, certHash)
+
+	// Remove from index
+	for _, name := range cert.Names {
+		if hashes, exists := certCache.cacheIndex[name]; exists {
+			for i, hash := range hashes {
+				if hash == certHash {
+					certCache.cacheIndex[name] = append(hashes[:i], hashes[i+1:]...)
+					break
+				}
+			}
+			// Clean up empty index entries
+			if len(certCache.cacheIndex[name]) == 0 {
+				delete(certCache.cacheIndex, name)
+			}
+		}
+	}
+
+	// Remove from LRU tracking (if initialized)
+	if certCache.lruList != nil && certCache.lruMap != nil {
+		if element, exists := certCache.lruMap[certHash]; exists {
+			certCache.lruList.Remove(element)
+			delete(certCache.lruMap, certHash)
+		}
+	}
+
+	// Update memory usage
+	certCache.currentMemoryBytes -= estimateCertificateMemoryUsage(cert)
+	if certCache.currentMemoryBytes < 0 {
+		certCache.currentMemoryBytes = 0
+	}
+
+	certCache.logger.Debug("evicted certificate from cache",
+		zap.Strings("names", cert.Names),
+		zap.String("hash", certHash),
+		zap.Int64("memory_bytes", certCache.currentMemoryBytes))
+}
+
+// isAtMemoryLimit checks if the cache is at or over the memory limit.
+// Must be called with read lock held.
+func (certCache *Cache) isAtMemoryLimit() bool {
+	certCache.optionsMu.RLock()
+	maxMemoryMB := certCache.options.MaxMemoryMB
+	certCache.optionsMu.RUnlock()
+
+	if maxMemoryMB <= 0 {
+		return false // No memory limit set
+	}
+
+	maxMemoryBytes := int64(maxMemoryMB) * 1024 * 1024
+	return certCache.currentMemoryBytes >= maxMemoryBytes
+}
+
+// isAtCapacityLimit checks if the cache is at or over the capacity limit.
+// Must be called with read lock held.
+func (certCache *Cache) isAtCapacityLimit() bool {
+	certCache.optionsMu.RLock()
+	capacity := certCache.options.Capacity
+	certCache.optionsMu.RUnlock()
+
+	if capacity <= 0 {
+		return false // No capacity limit set
+	}
+
+	return len(certCache.cache) >= capacity
+}
+
+// shouldEvict determines if certificates should be evicted to make room.
+// Must be called with read lock held.
+func (certCache *Cache) shouldEvict() bool {
+	return certCache.isAtMemoryLimit() || certCache.isAtCapacityLimit()
+}
+
+// performEviction evicts certificates according to the configured policy.
+// Must be called with write lock held.
+func (certCache *Cache) performEviction() {
+	certCache.optionsMu.RLock()
+	evictionPolicy := certCache.options.EvictionPolicy
+	certCache.optionsMu.RUnlock()
+
+	if evictionPolicy == "random" {
+		certCache.evictRandom()
+	} else {
+		certCache.evictLRU() // Default to LRU
+	}
+}
 
 // cacheCertificate calls unsyncedCacheCertificate with a write lock.
 //
@@ -201,7 +525,7 @@ func (certCache *Cache) cacheCertificate(cert Certificate) {
 
 // unsyncedCacheCertificate adds cert to the in-memory cache unless
 // it already exists in the cache (according to cert.Hash). It
-// updates the name index.
+// updates the name index and handles memory-aware eviction.
 //
 // This function is NOT safe for concurrent use. Callers MUST acquire
 // a write lock on certCache.mu first.
@@ -222,6 +546,9 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 			logMsg += "; appended any missing tags to cert"
 		}
 
+		// Update LRU since certificate was accessed
+		certCache.updateLRU(cert.hash)
+
 		certCache.logger.Debug(logMsg,
 			zap.Strings("subjects", cert.Names),
 			zap.Time("expiration", expiresAt(cert.Leaf)),
@@ -232,38 +559,34 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 		return
 	}
 
-	// if the cache is at capacity, make room for new cert
-	cacheSize := len(certCache.cache)
-	certCache.optionsMu.RLock()
-	atCapacity := certCache.options.Capacity > 0 && cacheSize >= certCache.options.Capacity
-	certCache.optionsMu.RUnlock()
+	// Evict certificates if at capacity or memory limit
+	for certCache.shouldEvict() {
+		certCache.logger.Debug("cache at limit; performing eviction",
+			zap.Strings("inserting_subjects", cert.Names),
+			zap.String("inserting_hash", cert.hash),
+			zap.Int("cache_size", len(certCache.cache)),
+			zap.Int64("memory_bytes", certCache.currentMemoryBytes))
+		certCache.performEviction()
 
-	if atCapacity {
-		// Go maps are "nondeterministic" but not actually random,
-		// so although we could just chop off the "front" of the
-		// map with less code, that is a heavily skewed eviction
-		// strategy; generating random numbers is cheap and
-		// ensures a much better distribution.
-		rnd := weakrand.Intn(cacheSize)
-		i := 0
-		for _, randomCert := range certCache.cache {
-			if i >= rnd && randomCert.managed { // don't evict manually-loaded certs
-				certCache.logger.Debug("cache full; evicting random certificate",
-					zap.Strings("removing_subjects", randomCert.Names),
-					zap.String("removing_hash", randomCert.hash),
-					zap.Strings("inserting_subjects", cert.Names),
-					zap.String("inserting_hash", cert.hash))
-				certCache.removeCertificate(randomCert)
-				break
-			}
-			i++
+		// Safety check to prevent infinite loop
+		if len(certCache.cache) == 0 {
+			break
 		}
 	}
 
-	// store the certificate
+	// Calculate memory usage for this certificate
+	certMemoryUsage := estimateCertificateMemoryUsage(cert)
+
+	// Store the certificate
 	certCache.cache[cert.hash] = cert
 
-	// update the index so we can access it by name
+	// Update memory tracking
+	certCache.currentMemoryBytes += certMemoryUsage
+
+	// Update LRU tracking
+	certCache.updateLRU(cert.hash)
+
+	// Update the index so we can access it by name
 	for _, name := range cert.Names {
 		certCache.cacheIndex[name] = append(certCache.cacheIndex[name], cert.hash)
 	}
@@ -276,43 +599,9 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 		zap.String("issuer_key", cert.issuerKey),
 		zap.String("hash", cert.hash),
 		zap.Int("cache_size", len(certCache.cache)),
-		zap.Int("cache_capacity", certCache.options.Capacity))
-	certCache.optionsMu.RUnlock()
-}
-
-// removeCertificate removes cert from the cache.
-//
-// This function is NOT safe for concurrent use; callers
-// MUST first acquire a write lock on certCache.mu.
-func (certCache *Cache) removeCertificate(cert Certificate) {
-	// delete all mentions of this cert from the name index
-	for _, name := range cert.Names {
-		keyList := certCache.cacheIndex[name]
-		for i := 0; i < len(keyList); i++ {
-			if keyList[i] == cert.hash {
-				keyList = append(keyList[:i], keyList[i+1:]...)
-				i--
-			}
-		}
-		if len(keyList) == 0 {
-			delete(certCache.cacheIndex, name)
-		} else {
-			certCache.cacheIndex[name] = keyList
-		}
-	}
-
-	// delete the actual cert from the cache
-	delete(certCache.cache, cert.hash)
-
-	certCache.optionsMu.RLock()
-	certCache.logger.Debug("removed certificate from cache",
-		zap.Strings("subjects", cert.Names),
-		zap.Time("expiration", expiresAt(cert.Leaf)),
-		zap.Bool("managed", cert.managed),
-		zap.String("issuer_key", cert.issuerKey),
-		zap.String("hash", cert.hash),
-		zap.Int("cache_size", len(certCache.cache)),
-		zap.Int("cache_capacity", certCache.options.Capacity))
+		zap.Int("cache_capacity", certCache.options.Capacity),
+		zap.Int("max_memory_mb", certCache.options.MaxMemoryMB),
+		zap.Int64("memory_bytes", certCache.currentMemoryBytes))
 	certCache.optionsMu.RUnlock()
 }
 
@@ -322,7 +611,7 @@ func (certCache *Cache) removeCertificate(cert Certificate) {
 // This method is safe for concurrent use.
 func (certCache *Cache) replaceCertificate(oldCert, newCert Certificate) {
 	certCache.mu.Lock()
-	certCache.removeCertificate(oldCert)
+	certCache.removeCertificate(oldCert.hash)
 	certCache.unsyncedCacheCertificate(newCert)
 	certCache.mu.Unlock()
 	certCache.logger.Info("replaced certificate in cache",
@@ -333,14 +622,17 @@ func (certCache *Cache) replaceCertificate(oldCert, newCert Certificate) {
 // getAllMatchingCerts returns all certificates with exactly this subject
 // (wildcards are NOT expanded).
 func (certCache *Cache) getAllMatchingCerts(subject string) []Certificate {
-	certCache.mu.RLock()
-	defer certCache.mu.RUnlock()
+	certCache.mu.Lock()
+	defer certCache.mu.Unlock()
 
 	allCertKeys := certCache.cacheIndex[subject]
 
 	certs := make([]Certificate, len(allCertKeys))
 	for i := range allCertKeys {
-		certs[i] = certCache.cache[allCertKeys[i]]
+		certHash := allCertKeys[i]
+		certs[i] = certCache.cache[certHash]
+		// Update LRU since certificate was accessed
+		certCache.updateLRU(certHash)
 	}
 
 	return certs
@@ -429,8 +721,7 @@ func (certCache *Cache) RemoveManaged(subjects []SubjectIssuer) {
 func (certCache *Cache) Remove(hashes []string) {
 	certCache.mu.Lock()
 	for _, h := range hashes {
-		cert := certCache.cache[h]
-		certCache.removeCertificate(cert)
+		certCache.removeCertificate(h)
 	}
 	certCache.mu.Unlock()
 }

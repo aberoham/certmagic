@@ -219,7 +219,7 @@ func (certCache *Cache) RenewManagedCertificates(ctx context.Context) error {
 	// Deletion queue
 	certCache.mu.Lock()
 	for _, cert := range deleteQueue {
-		certCache.removeCertificate(cert)
+		certCache.removeCertificate(cert.hash)
 	}
 	certCache.mu.Unlock()
 
@@ -252,7 +252,7 @@ func (certCache *Cache) queueRenewalTask(ctx context.Context, oldCert Certificat
 			if cfg.OnDemand != nil {
 				// loaded dynamically, remove dynamically
 				certCache.mu.Lock()
-				certCache.removeCertificate(oldCert)
+				certCache.removeCertificate(oldCert.hash)
 				certCache.mu.Unlock()
 			}
 			return fmt.Errorf("%v %v", oldCert.Names, err)
@@ -900,7 +900,7 @@ func (cfg *Config) forceRenew(ctx context.Context, logger *zap.Logger, cert Cert
 				zap.Strings("identifiers", cert.Names),
 				zap.Error(err))
 			cfg.certCache.mu.Lock()
-			cfg.certCache.removeCertificate(cert)
+			cfg.certCache.removeCertificate(cert.hash)
 			cfg.certCache.mu.Unlock()
 		}
 		return cert, fmt.Errorf("unable to forcefully get new certificate for %v: %w", cert.Names, err)

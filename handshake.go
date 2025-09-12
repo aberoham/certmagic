@@ -750,7 +750,7 @@ func (cfg *Config) renewDynamicCertificate(ctx context.Context, hello *tls.Clien
 		if err != nil {
 			// if not, remove from cache (it will be deleted from storage later)
 			cfg.certCache.mu.Lock()
-			cfg.certCache.removeCertificate(currentCert)
+			cfg.certCache.removeCertificate(currentCert.hash)
 			cfg.certCache.mu.Unlock()
 			unblockWaiters()
 
