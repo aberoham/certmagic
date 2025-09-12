@@ -80,6 +80,21 @@ func (cert Certificate) NeedsRenewal(cfg *Config) bool {
 	return cfg.certNeedsRenewal(cert.Leaf, cert.ari, true)
 }
 
+// HasOCSP returns true if the certificate has an OCSP response available.
+// This checks if OCSP data exists or can be fetched.
+func (cert Certificate) HasOCSP() bool {
+	return cert.ocsp != nil || cert.canFetchOCSP()
+}
+
+// canFetchOCSP checks if OCSP can be fetched for this certificate
+func (cert Certificate) canFetchOCSP() bool {
+	// Check if the certificate has OCSP server URLs
+	if cert.Leaf == nil {
+		return false
+	}
+	return len(cert.Leaf.OCSPServer) > 0
+}
+
 // certNeedsRenewal consults ACME Renewal Info (ARI) and certificate expiration to determine
 // whether the leaf certificate needs to be renewed yet. If true is returned, the certificate
 // should be renewed as soon as possible. The reasoning for a true return value is logged

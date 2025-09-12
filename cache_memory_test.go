@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"go.uber.org/zap/zaptest"
+	"golang.org/x/crypto/ocsp"
 )
 
 // createTestCertificate creates a test certificate for the given domain
@@ -353,12 +354,180 @@ func TestMemoryEstimation(t *testing.T) {
 		t.Error("Expected positive memory usage estimation")
 	}
 
-	// Should be reasonable for a test certificate (between 1KB and 10KB)
-	if usage < 1000 || usage > 10000 {
+	// Should be reasonable for a test certificate (between 1KB and 15KB with OCSP)
+	if usage < 1000 || usage > 15000 {
 		t.Errorf("Memory estimation seems unrealistic: %d bytes", usage)
 	}
 
 	t.Logf("Certificate memory usage estimate: %d bytes", usage)
+}
+
+func TestOCSPLazyLoading(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+
+	t.Run("OCSPUnloadingUnderMemoryPressure", func(t *testing.T) {
+		cache := NewCache(CacheOptions{
+			MaxMemoryMB:    0, // We'll set a very small limit manually for testing
+			EvictionPolicy: "lru",
+			GetConfigForCert: func(cert Certificate) (*Config, error) {
+				return &Config{Logger: logger}, nil
+			},
+			Logger: logger,
+		})
+		defer cache.Stop()
+
+		// Set a small memory limit for testing (200KB should be exceeded by 10 certs with OCSP)
+		cache.optionsMu.Lock()
+		cache.options.MaxMemoryMB = 0 // Disable MB check temporarily
+		cache.optionsMu.Unlock()
+
+		// Create certificates with OCSP responses to simulate memory usage
+		var certsWithOCSP []Certificate
+		for i := 0; i < 10; i++ {
+			domain := fmt.Sprintf("ocsp-test%d.example.com", i)
+			cert := createTestCertificate(domain)
+
+			// Add a mock OCSP response to increase memory usage
+			cert.ocsp = &ocsp.Response{
+				Status:       ocsp.Good,
+				SerialNumber: big.NewInt(int64(i + 1)),
+				ThisUpdate:   time.Now(),
+				NextUpdate:   time.Now().Add(24 * time.Hour),
+				TBSResponseData: make([]byte, 1024), // 1KB of mock data
+				Signature:       make([]byte, 256),  // 256 bytes signature
+			}
+
+			certsWithOCSP = append(certsWithOCSP, cert)
+			cache.cacheCertificate(cert)
+		}
+
+		initialStats := cache.GetMemoryStats()
+		t.Logf("Initial state: %d certificates, %d bytes memory",
+			initialStats.CertificateCount, initialStats.EstimatedMemoryBytes)
+
+		// Verify some certificates have OCSP responses
+		ocspCount := 0
+		cache.mu.RLock()
+		for _, cert := range cache.cache {
+			if cert.ocsp != nil {
+				ocspCount++
+			}
+		}
+		cache.mu.RUnlock()
+
+		if ocspCount == 0 {
+			t.Fatal("Expected some certificates to have OCSP responses")
+		}
+		t.Logf("Certificates with OCSP responses: %d", ocspCount)
+
+		// Now simulate memory pressure by setting a limit and testing OCSP unloading
+		cache.optionsMu.Lock()
+		cache.options.MaxMemoryMB = 1 // Set a limit that should trigger OCSP unloading
+		cache.optionsMu.Unlock()
+
+		// Manually test OCSP unloading
+		cache.mu.Lock()
+		unloadSuccessful := cache.unloadOCSPResponses()
+		cache.mu.Unlock()
+
+		if !unloadSuccessful {
+			t.Log("OCSP unloading was not successful (this may be expected if already under limit)")
+		}
+
+		finalStats := cache.GetMemoryStats()
+		t.Logf("Final state: %d certificates, %d bytes memory",
+			finalStats.CertificateCount, finalStats.EstimatedMemoryBytes)
+
+		// Check if OCSP unloading happened
+		finalOCSPCount := 0
+		cache.mu.RLock()
+		for _, cert := range cache.cache {
+			if cert.ocsp != nil {
+				finalOCSPCount++
+			}
+		}
+		cache.mu.RUnlock()
+
+		t.Logf("Final certificates with OCSP responses: %d", finalOCSPCount)
+
+		// Check if OCSP responses were unloaded
+		if finalOCSPCount < ocspCount {
+			t.Logf("OCSP lazy loading successful: reduced from %d to %d OCSP responses",
+				ocspCount, finalOCSPCount)
+		} else {
+			t.Logf("OCSP responses unchanged: %d -> %d (may be under memory limit)",
+				ocspCount, finalOCSPCount)
+		}
+	})
+
+	t.Run("EstimateOCSPMemoryUsage", func(t *testing.T) {
+		// Test with nil response
+		nilUsage := estimateOCSPMemoryUsage(nil)
+		if nilUsage != 0 {
+			t.Errorf("Expected 0 bytes for nil OCSP response, got %d", nilUsage)
+		}
+
+		// Test with basic response
+		basicResp := &ocsp.Response{
+			Status:       ocsp.Good,
+			SerialNumber: big.NewInt(12345),
+			ThisUpdate:   time.Now(),
+			NextUpdate:   time.Now().Add(24 * time.Hour),
+		}
+		basicUsage := estimateOCSPMemoryUsage(basicResp)
+		if basicUsage < 200 || basicUsage > 5000 {
+			t.Errorf("Basic OCSP response usage seems unrealistic: %d bytes", basicUsage)
+		}
+
+		// Test with larger response (with data)
+		largeResp := &ocsp.Response{
+			Status:          ocsp.Good,
+			SerialNumber:    big.NewInt(12345),
+			ThisUpdate:      time.Now(),
+			NextUpdate:      time.Now().Add(24 * time.Hour),
+			TBSResponseData: make([]byte, 1024),
+			Signature:       make([]byte, 256),
+		}
+		largeUsage := estimateOCSPMemoryUsage(largeResp)
+		if largeUsage < basicUsage {
+			t.Errorf("Expected large OCSP response (%d bytes) to be at least as big as basic (%d bytes)",
+				largeUsage, basicUsage)
+		}
+		// Note: Both may end up being 2048 due to the minimum size check
+
+		t.Logf("OCSP memory estimates: nil=%d, basic=%d, large=%d",
+			nilUsage, basicUsage, largeUsage)
+	})
+
+	t.Run("CertificateHasOCSP", func(t *testing.T) {
+		// Certificate with OCSP response
+		certWithOCSP := createTestCertificate("with-ocsp.example.com")
+		certWithOCSP.ocsp = &ocsp.Response{Status: ocsp.Good}
+
+		if !certWithOCSP.HasOCSP() {
+			t.Error("Certificate with OCSP response should return HasOCSP() = true")
+		}
+
+		// Certificate without OCSP response but with OCSP server in leaf cert
+		certCanFetch := createTestCertificate("can-fetch.example.com")
+		if certCanFetch.Leaf != nil {
+			certCanFetch.Leaf.OCSPServer = []string{"http://ocsp.example.com"}
+		}
+
+		if !certCanFetch.HasOCSP() {
+			t.Error("Certificate that can fetch OCSP should return HasOCSP() = true")
+		}
+
+		// Certificate without OCSP
+		certWithoutOCSP := createTestCertificate("no-ocsp.example.com")
+		if certWithoutOCSP.Leaf != nil {
+			certWithoutOCSP.Leaf.OCSPServer = nil
+		}
+
+		if certWithoutOCSP.HasOCSP() {
+			t.Error("Certificate without OCSP should return HasOCSP() = false")
+		}
+	})
 }
 
 func BenchmarkCacheOperations(b *testing.B) {

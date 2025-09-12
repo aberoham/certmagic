@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/crypto/ocsp"
 )
 
 // Cache is a structure that stores certificates in memory.
@@ -349,9 +350,9 @@ func estimateCertificateMemoryUsage(cert Certificate) int64 {
 		total += int64(len(tag)) + 16 // string overhead
 	}
 
-	// OCSP response (if present)
+	// OCSP response (if present) - this is where we can save memory
 	if cert.ocsp != nil {
-		total += 4096 // Conservative estimate for OCSP response
+		total += estimateOCSPMemoryUsage(cert.ocsp)
 	}
 
 	// Other string fields
@@ -362,6 +363,41 @@ func estimateCertificateMemoryUsage(cert Certificate) int64 {
 	total += 200
 
 	return total
+}
+
+// estimateOCSPMemoryUsage estimates the memory usage of an OCSP response
+func estimateOCSPMemoryUsage(resp *ocsp.Response) int64 {
+	if resp == nil {
+		return 0
+	}
+
+	// Basic OCSP response structure
+	size := int64(200) // Base struct size
+
+	// Add size for variable fields
+	if len(resp.TBSResponseData) > 0 {
+		size += int64(len(resp.TBSResponseData))
+	}
+	if len(resp.Signature) > 0 {
+		size += int64(len(resp.Signature))
+	}
+
+	// Certificate in response (if any)
+	if resp.Certificate != nil && len(resp.Certificate.Raw) > 0 {
+		size += int64(len(resp.Certificate.Raw))
+	}
+
+	// Extensions
+	for _, ext := range resp.Extensions {
+		size += int64(len(ext.Value)) + 50 // OID overhead
+	}
+
+	// Use a conservative minimum estimate
+	if size < 1500 {
+		size = 2048 // Typical OCSP response size
+	}
+
+	return size
 }
 
 // updateLRU updates the LRU tracking for a certificate.
@@ -501,17 +537,118 @@ func (certCache *Cache) shouldEvict() bool {
 }
 
 // performEviction evicts certificates according to the configured policy.
+// If memory pressure is high, it first tries to unload OCSP responses
+// before removing entire certificates.
 // Must be called with write lock held.
 func (certCache *Cache) performEviction() {
 	certCache.optionsMu.RLock()
 	evictionPolicy := certCache.options.EvictionPolicy
 	certCache.optionsMu.RUnlock()
 
+	// First try OCSP unloading if we're under memory pressure
+	if certCache.isAtMemoryLimit() && !certCache.isAtCapacityLimit() {
+		if certCache.unloadOCSPResponses() {
+			return // OCSP unloading was successful
+		}
+	}
+
+	// If OCSP unloading wasn't enough, evict certificates
 	if evictionPolicy == "random" {
 		certCache.evictRandom()
 	} else {
 		certCache.evictLRU() // Default to LRU
 	}
+}
+
+// unloadOCSPResponses unloads OCSP responses from certificates to save memory.
+// Returns true if it successfully freed enough memory to get under the limit.
+// Must be called with write lock held.
+func (certCache *Cache) unloadOCSPResponses() bool {
+	if len(certCache.cache) == 0 {
+		return false
+	}
+
+	var freedBytes int64
+	var certsProcessed int
+
+	// Target: free enough memory to get 10% below the limit
+	certCache.optionsMu.RLock()
+	maxMemoryMB := certCache.options.MaxMemoryMB
+	certCache.optionsMu.RUnlock()
+
+	if maxMemoryMB <= 0 {
+		return false
+	}
+
+	targetBytes := int64(maxMemoryMB) * 1024 * 1024 * 90 / 100 // 90% of limit
+	needToFree := certCache.currentMemoryBytes - targetBytes
+
+	if needToFree <= 0 {
+		return true // Already under target
+	}
+
+	// Sort certificates by LRU order (least recently used first)
+	sortedHashes := certCache.getSortedLRUHashes()
+
+	for _, certHash := range sortedHashes {
+		cert, exists := certCache.cache[certHash]
+		if !exists || cert.ocsp == nil {
+			continue
+		}
+
+		// Calculate memory that would be freed
+		ocspMemory := estimateOCSPMemoryUsage(cert.ocsp)
+
+		// Unload the OCSP response
+		cert.ocsp = nil
+		certCache.cache[certHash] = cert
+		freedBytes += ocspMemory
+		certsProcessed++
+
+		certCache.logger.Debug("unloaded OCSP response to save memory",
+			zap.Strings("cert_names", cert.Names),
+			zap.String("cert_hash", certHash),
+			zap.Int64("freed_bytes", ocspMemory))
+
+		if freedBytes >= needToFree {
+			break
+		}
+
+		// Don't process too many certificates at once
+		if certsProcessed >= 50 {
+			break
+		}
+	}
+
+	// Update memory tracking
+	certCache.currentMemoryBytes -= freedBytes
+
+	certCache.logger.Info("OCSP lazy loading: unloaded responses to save memory",
+		zap.Int("certificates_processed", certsProcessed),
+		zap.Int64("memory_freed_bytes", freedBytes),
+		zap.Int64("current_memory_bytes", certCache.currentMemoryBytes))
+
+	return certCache.currentMemoryBytes < targetBytes
+}
+
+// getSortedLRUHashes returns certificate hashes sorted by LRU order (least recently used first)
+func (certCache *Cache) getSortedLRUHashes() []string {
+	if certCache.lruList == nil {
+		// Fallback: just return all hashes
+		hashes := make([]string, 0, len(certCache.cache))
+		for hash := range certCache.cache {
+			hashes = append(hashes, hash)
+		}
+		return hashes
+	}
+
+	hashes := make([]string, 0, certCache.lruList.Len())
+	for e := certCache.lruList.Back(); e != nil; e = e.Prev() {
+		if certHash, ok := e.Value.(string); ok {
+			hashes = append(hashes, certHash)
+		}
+	}
+	return hashes
 }
 
 // cacheCertificate calls unsyncedCacheCertificate with a write lock.
