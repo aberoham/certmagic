@@ -15,8 +15,15 @@
 package certmagic
 
 import (
+	"bytes"
+	"compress/gzip"
 	"container/list"
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"crypto/tls"
+	"encoding/gob"
 	"fmt"
+	"io"
 	weakrand "math/rand"
 	"runtime"
 	"strings"
@@ -26,6 +33,14 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/ocsp"
 )
+
+func init() {
+	// Register key types for gob encoding/decoding
+	gob.Register(&rsa.PrivateKey{})
+	gob.Register(&ecdsa.PrivateKey{})
+	gob.Register(&rsa.PublicKey{})
+	gob.Register(&ecdsa.PublicKey{})
+}
 
 // Cache is a structure that stores certificates in memory.
 // A Cache indexes certificates by name for quick access
@@ -56,6 +71,9 @@ type Cache struct {
 
 	// The cache is keyed by certificate hash
 	cache map[string]Certificate
+	
+	// Compressed certificate cache (when compression is enabled)
+	compressedCache map[string]*CompressedCertificate
 
 	// cacheIndex is a map of SAN to cache key (cert hash)
 	cacheIndex map[string][]string
@@ -98,8 +116,9 @@ func (certCache *Cache) GetMemoryStats() MemoryStats {
 	// Get runtime memory stats
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
+	totalCertCount := len(certCache.cache) + len(certCache.compressedCache)
 	return MemoryStats{
-		CertificateCount:     len(certCache.cache),
+		CertificateCount:     totalCertCount,
 		EstimatedMemoryBytes: certCache.currentMemoryBytes,
 		EstimatedMemoryMB:    int(certCache.currentMemoryBytes / (1024 * 1024)),
 		RuntimeHeapBytes:     int64(m.HeapAlloc),
@@ -205,6 +224,7 @@ func (certCache *Cache) startMemoryMonitor(interval time.Duration) {
 func NewCache(opts CacheOptions) *Cache {
 	c := &Cache{
 		cache:              make(map[string]Certificate),
+		compressedCache:    make(map[string]*CompressedCertificate),
 		cacheIndex:         make(map[string][]string),
 		currentMemoryBytes: 0,
 		lruList:            list.New(),
@@ -313,6 +333,10 @@ type CacheOptions struct {
 	// "lru" (default) for Least Recently Used, "random" for random eviction.
 	EvictionPolicy string
 
+	// Enable compression for certificate storage to reduce memory usage.
+	// When enabled, certificates are stored compressed with gzip and decompressed on access.
+	EnableCompression bool
+
 	// Set a logger to enable logging
 	Logger *zap.Logger
 }
@@ -321,6 +345,131 @@ type CacheOptions struct {
 // valid config that should be used when managing the
 // given certificate or its assets.
 type ConfigGetter func(Certificate) (*Config, error)
+
+// CompressedCertificate holds certificate data in compressed form
+// to reduce memory usage. The full certificate is decompressed
+// only when needed (lazy loading).
+type CompressedCertificate struct {
+	// Compressed certificate data (gzipped tls.Certificate)
+	CompressedData []byte
+	
+	// Certificate metadata for quick access without decompression
+	Names       []string
+	Hash        string
+	NotBefore   time.Time
+	NotAfter    time.Time
+	Managed     bool
+	IssuerKey   string
+	
+	// Cached decompressed certificate (nil when not loaded)
+	cached     *tls.Certificate
+	cachedAt   time.Time
+	cacheTTL   time.Duration // How long to keep the decompressed cert
+}
+
+// compressCertificate compresses a Certificate into a CompressedCertificate.
+// The tls.Certificate is serialized and compressed with gzip.
+func compressCertificate(cert Certificate) (*CompressedCertificate, error) {
+	// Serialize the tls.Certificate for compression
+	var buf bytes.Buffer
+	encoder := gob.NewEncoder(&buf)
+	if err := encoder.Encode(cert.Certificate); err != nil {
+		return nil, fmt.Errorf("failed to serialize certificate: %w", err)
+	}
+
+	// Compress the serialized data
+	var compressedBuf bytes.Buffer
+	gzipWriter := gzip.NewWriter(&compressedBuf)
+	if _, err := gzipWriter.Write(buf.Bytes()); err != nil {
+		return nil, fmt.Errorf("failed to compress certificate: %w", err)
+	}
+	if err := gzipWriter.Close(); err != nil {
+		return nil, fmt.Errorf("failed to close gzip writer: %w", err)
+	}
+
+	// Extract metadata that doesn't require decompression
+	return &CompressedCertificate{
+		CompressedData: compressedBuf.Bytes(),
+		Names:          append([]string(nil), cert.Names...), // Copy slice
+		Hash:           cert.Hash(),
+		NotBefore:      cert.Leaf.NotBefore,
+		NotAfter:       cert.Leaf.NotAfter,
+		Managed:        cert.managed,
+		IssuerKey:      cert.issuerKey,
+		cacheTTL:       time.Hour, // Cache decompressed cert for 1 hour
+	}, nil
+}
+
+// decompressCertificate decompresses certificate data and returns a full Certificate.
+func (cc *CompressedCertificate) decompressCertificate() (Certificate, error) {
+	// Check if we have a cached decompressed certificate that's still fresh
+	if cc.cached != nil && time.Since(cc.cachedAt) < cc.cacheTTL {
+		return Certificate{
+			Certificate: *cc.cached,
+			Names:       cc.Names,
+			hash:        cc.Hash,
+			managed:     cc.Managed,
+			issuerKey:   cc.IssuerKey,
+		}, nil
+	}
+
+	// Decompress the certificate data
+	gzipReader, err := gzip.NewReader(bytes.NewReader(cc.CompressedData))
+	if err != nil {
+		return Certificate{}, fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	defer gzipReader.Close()
+
+	decompressedData, err := io.ReadAll(gzipReader)
+	if err != nil {
+		return Certificate{}, fmt.Errorf("failed to decompress certificate: %w", err)
+	}
+
+	// Deserialize the certificate
+	var tlsCert tls.Certificate
+	decoder := gob.NewDecoder(bytes.NewReader(decompressedData))
+	if err := decoder.Decode(&tlsCert); err != nil {
+		return Certificate{}, fmt.Errorf("failed to deserialize certificate: %w", err)
+	}
+
+	// Cache the decompressed certificate
+	cc.cached = &tlsCert
+	cc.cachedAt = time.Now()
+
+	return Certificate{
+		Certificate: tlsCert,
+		Names:       cc.Names,
+		hash:        cc.Hash,
+		managed:     cc.Managed,
+		issuerKey:   cc.IssuerKey,
+	}, nil
+}
+
+// estimateCompressedMemoryUsage estimates memory usage of a CompressedCertificate.
+func (cc *CompressedCertificate) estimateMemoryUsage() int64 {
+	size := int64(len(cc.CompressedData))
+	
+	// Metadata overhead
+	for _, name := range cc.Names {
+		size += int64(len(name))
+	}
+	size += int64(len(cc.Hash) + len(cc.IssuerKey))
+	size += 120 // time structs and other fields
+	
+	// If cached, add decompressed size
+	if cc.cached != nil {
+		// Estimate decompressed certificate size
+		for _, certData := range cc.cached.Certificate {
+			size += int64(len(certData))
+		}
+		if cc.cached.PrivateKey != nil {
+			size += 2048 // Rough estimate for private key
+		}
+		size += 200 // Other tls.Certificate fields
+	}
+	
+	return size
+}
 
 // estimateCertificateMemoryUsage returns an estimate of the memory
 // usage of a certificate in bytes, including all associated data.
@@ -457,16 +606,26 @@ func (certCache *Cache) evictRandom() {
 // removeCertificate removes a certificate from cache, index, memory tracking, and LRU.
 // Must be called with write lock held.
 func (certCache *Cache) removeCertificate(certHash string) {
-	cert, exists := certCache.cache[certHash]
-	if !exists {
-		return
+	var certNames []string
+	var memoryUsage int64
+	
+	// Check both caches to find the certificate
+	if cert, exists := certCache.cache[certHash]; exists {
+		certNames = cert.Names
+		memoryUsage = estimateCertificateMemoryUsage(cert)
+		// Remove from regular cache
+		delete(certCache.cache, certHash)
+	} else if compressedCert, exists := certCache.compressedCache[certHash]; exists {
+		certNames = compressedCert.Names
+		memoryUsage = compressedCert.estimateMemoryUsage()
+		// Remove from compressed cache
+		delete(certCache.compressedCache, certHash)
+	} else {
+		return // Certificate not found in either cache
 	}
 
-	// Remove from main cache
-	delete(certCache.cache, certHash)
-
 	// Remove from index
-	for _, name := range cert.Names {
+	for _, name := range certNames {
 		if hashes, exists := certCache.cacheIndex[name]; exists {
 			for i, hash := range hashes {
 				if hash == certHash {
@@ -490,13 +649,13 @@ func (certCache *Cache) removeCertificate(certHash string) {
 	}
 
 	// Update memory usage
-	certCache.currentMemoryBytes -= estimateCertificateMemoryUsage(cert)
+	certCache.currentMemoryBytes -= memoryUsage
 	if certCache.currentMemoryBytes < 0 {
 		certCache.currentMemoryBytes = 0
 	}
 
 	certCache.logger.Debug("evicted certificate from cache",
-		zap.Strings("names", cert.Names),
+		zap.Strings("names", certNames),
 		zap.String("hash", certHash),
 		zap.Int64("memory_bytes", certCache.currentMemoryBytes))
 }
@@ -527,7 +686,8 @@ func (certCache *Cache) isAtCapacityLimit() bool {
 		return false // No capacity limit set
 	}
 
-	return len(certCache.cache) >= capacity
+	totalCertCount := len(certCache.cache) + len(certCache.compressedCache)
+	return totalCertCount >= capacity
 }
 
 // shouldEvict determines if certificates should be evicted to make room.
@@ -667,33 +827,80 @@ func (certCache *Cache) cacheCertificate(cert Certificate) {
 // This function is NOT safe for concurrent use. Callers MUST acquire
 // a write lock on certCache.mu first.
 func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
-	// if this certificate already exists in the cache, this is basically
-	// a no-op so we reuse existing cert (prevent duplication), but we do
-	// modify the cert to add tags it may be missing (see issue #211)
-	if existingCert, ok := certCache.cache[cert.hash]; ok {
-		logMsg := "certificate already cached"
-
-		if len(cert.Tags) > 0 {
-			for _, tag := range cert.Tags {
-				if !existingCert.HasTag(tag) {
-					existingCert.Tags = append(existingCert.Tags, tag)
+	// Check if certificate is already cached (check both regular and compressed caches)
+	certCache.optionsMu.RLock()
+	compressionEnabled := certCache.options.EnableCompression
+	certCache.optionsMu.RUnlock()
+	
+	if compressionEnabled {
+		if existingCert, ok := certCache.compressedCache[cert.hash]; ok {
+			logMsg := "compressed certificate already cached"
+			
+			if len(cert.Tags) > 0 {
+				// Need to decompress, modify tags, and re-compress
+				decompressedCert, err := existingCert.decompressCertificate()
+				if err != nil {
+					certCache.logger.Error("failed to decompress existing certificate for tag update", zap.Error(err))
+					return
+				}
+				
+				tagsModified := false
+				for _, tag := range cert.Tags {
+					if !decompressedCert.HasTag(tag) {
+						decompressedCert.Tags = append(decompressedCert.Tags, tag)
+						tagsModified = true
+					}
+				}
+				
+				if tagsModified {
+					compressedCert, err := compressCertificate(decompressedCert)
+					if err != nil {
+						certCache.logger.Error("failed to re-compress certificate after tag update", zap.Error(err))
+						return
+					}
+					certCache.compressedCache[cert.hash] = compressedCert
+					logMsg += "; appended any missing tags to cert"
 				}
 			}
-			certCache.cache[cert.hash] = existingCert
-			logMsg += "; appended any missing tags to cert"
+			
+			// Update LRU since certificate was accessed
+			certCache.updateLRU(cert.hash)
+			
+			certCache.logger.Debug(logMsg,
+				zap.Strings("subjects", cert.Names),
+				zap.Time("expiration", expiresAt(cert.Leaf)),
+				zap.Bool("managed", cert.managed),
+				zap.String("issuer_key", cert.issuerKey),
+				zap.String("hash", cert.hash),
+				zap.Strings("tags", cert.Tags))
+			return
 		}
+	} else {
+		if existingCert, ok := certCache.cache[cert.hash]; ok {
+			logMsg := "certificate already cached"
 
-		// Update LRU since certificate was accessed
-		certCache.updateLRU(cert.hash)
+			if len(cert.Tags) > 0 {
+				for _, tag := range cert.Tags {
+					if !existingCert.HasTag(tag) {
+						existingCert.Tags = append(existingCert.Tags, tag)
+					}
+				}
+				certCache.cache[cert.hash] = existingCert
+				logMsg += "; appended any missing tags to cert"
+			}
 
-		certCache.logger.Debug(logMsg,
-			zap.Strings("subjects", cert.Names),
-			zap.Time("expiration", expiresAt(cert.Leaf)),
-			zap.Bool("managed", cert.managed),
-			zap.String("issuer_key", cert.issuerKey),
-			zap.String("hash", cert.hash),
-			zap.Strings("tags", cert.Tags))
-		return
+			// Update LRU since certificate was accessed
+			certCache.updateLRU(cert.hash)
+
+			certCache.logger.Debug(logMsg,
+				zap.Strings("subjects", cert.Names),
+				zap.Time("expiration", expiresAt(cert.Leaf)),
+				zap.Bool("managed", cert.managed),
+				zap.String("issuer_key", cert.issuerKey),
+				zap.String("hash", cert.hash),
+				zap.Strings("tags", cert.Tags))
+			return
+		}
 	}
 
 	// Evict certificates if at capacity or memory limit
@@ -711,11 +918,25 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 		}
 	}
 
-	// Calculate memory usage for this certificate
-	certMemoryUsage := estimateCertificateMemoryUsage(cert)
-
-	// Store the certificate
-	certCache.cache[cert.hash] = cert
+	// Store the certificate (compressed or uncompressed based on configuration)
+	var certMemoryUsage int64
+	if compressionEnabled {
+		// Compress and store the certificate
+		compressedCert, err := compressCertificate(cert)
+		if err != nil {
+			certCache.logger.Error("failed to compress certificate, storing uncompressed", zap.Error(err))
+			// Fall back to uncompressed storage
+			certCache.cache[cert.hash] = cert
+			certMemoryUsage = estimateCertificateMemoryUsage(cert)
+		} else {
+			certCache.compressedCache[cert.hash] = compressedCert
+			certMemoryUsage = compressedCert.estimateMemoryUsage()
+		}
+	} else {
+		// Store uncompressed
+		certCache.cache[cert.hash] = cert
+		certMemoryUsage = estimateCertificateMemoryUsage(cert)
+	}
 
 	// Update memory tracking
 	certCache.currentMemoryBytes += certMemoryUsage
@@ -729,16 +950,27 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 	}
 
 	certCache.optionsMu.RLock()
-	certCache.logger.Debug("added certificate to cache",
+	totalCacheSize := len(certCache.cache) + len(certCache.compressedCache)
+	logFields := []zap.Field{
 		zap.Strings("subjects", cert.Names),
 		zap.Time("expiration", expiresAt(cert.Leaf)),
 		zap.Bool("managed", cert.managed),
 		zap.String("issuer_key", cert.issuerKey),
 		zap.String("hash", cert.hash),
-		zap.Int("cache_size", len(certCache.cache)),
+		zap.Int("total_cache_size", totalCacheSize),
 		zap.Int("cache_capacity", certCache.options.Capacity),
 		zap.Int("max_memory_mb", certCache.options.MaxMemoryMB),
-		zap.Int64("memory_bytes", certCache.currentMemoryBytes))
+		zap.Int64("memory_bytes", certCache.currentMemoryBytes),
+		zap.Bool("compression_enabled", certCache.options.EnableCompression),
+	}
+	
+	if compressionEnabled {
+		logFields = append(logFields, zap.Int("compressed_cache_size", len(certCache.compressedCache)))
+		certCache.logger.Debug("added compressed certificate to cache", logFields...)
+	} else {
+		logFields = append(logFields, zap.Int("uncompressed_cache_size", len(certCache.cache)))
+		certCache.logger.Debug("added certificate to cache", logFields...)
+	}
 	certCache.optionsMu.RUnlock()
 }
 
@@ -763,11 +995,23 @@ func (certCache *Cache) getAllMatchingCerts(subject string) []Certificate {
 	defer certCache.mu.Unlock()
 
 	allCertKeys := certCache.cacheIndex[subject]
-
-	certs := make([]Certificate, len(allCertKeys))
-	for i := range allCertKeys {
-		certHash := allCertKeys[i]
-		certs[i] = certCache.cache[certHash]
+	certs := make([]Certificate, 0, len(allCertKeys))
+	
+	for _, certHash := range allCertKeys {
+		// Try compressed cache first, then regular cache
+		if compressedCert, ok := certCache.compressedCache[certHash]; ok {
+			cert, err := compressedCert.decompressCertificate()
+			if err != nil {
+				certCache.logger.Error("failed to decompress certificate during retrieval", 
+					zap.String("hash", certHash), zap.Error(err))
+				continue // Skip this certificate
+			}
+			certs = append(certs, cert)
+		} else if cert, ok := certCache.cache[certHash]; ok {
+			certs = append(certs, cert)
+		}
+		// Note: if certificate is not found in either cache, it might have been evicted
+		
 		// Update LRU since certificate was accessed
 		certCache.updateLRU(certHash)
 	}
@@ -778,10 +1022,25 @@ func (certCache *Cache) getAllMatchingCerts(subject string) []Certificate {
 func (certCache *Cache) getAllCerts() []Certificate {
 	certCache.mu.RLock()
 	defer certCache.mu.RUnlock()
-	certs := make([]Certificate, 0, len(certCache.cache))
+	
+	totalSize := len(certCache.cache) + len(certCache.compressedCache)
+	certs := make([]Certificate, 0, totalSize)
+	
+	// Add regular certificates
 	for _, cert := range certCache.cache {
 		certs = append(certs, cert)
 	}
+	
+	// Add decompressed certificates
+	for _, compressedCert := range certCache.compressedCache {
+		cert, err := compressedCert.decompressCertificate()
+		if err != nil {
+			certCache.logger.Error("failed to decompress certificate in getAllCerts", zap.Error(err))
+			continue
+		}
+		certs = append(certs, cert)
+	}
+	
 	return certs
 }
 

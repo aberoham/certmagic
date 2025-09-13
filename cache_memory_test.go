@@ -575,3 +575,212 @@ func BenchmarkCacheOperations(b *testing.B) {
 		}
 	})
 }
+
+func TestCertificateCompression(t *testing.T) {
+	// Test compression functionality
+	t.Run("CompressionAndDecompression", func(t *testing.T) {
+		cert := createTestCertificate("compression-test.example.com")
+		
+		// Compress the certificate
+		compressed, err := compressCertificate(cert)
+		if err != nil {
+			t.Fatalf("Failed to compress certificate: %v", err)
+		}
+		
+		// Verify metadata is preserved
+		if compressed.Hash != cert.Hash() {
+			t.Error("Certificate hash not preserved in compression")
+		}
+		if len(compressed.Names) != len(cert.Names) {
+			t.Error("Certificate names not preserved in compression")
+		}
+		if compressed.Names[0] != cert.Names[0] {
+			t.Error("Certificate name mismatch in compression")
+		}
+		
+		// Decompress the certificate
+		decompressed, err := compressed.decompressCertificate()
+		if err != nil {
+			t.Fatalf("Failed to decompress certificate: %v", err)
+		}
+		
+		// Verify the decompressed certificate matches original
+		if decompressed.Hash() != cert.Hash() {
+			t.Error("Decompressed certificate hash doesn't match original")
+		}
+		if len(decompressed.Names) != len(cert.Names) {
+			t.Error("Decompressed certificate names don't match original")
+		}
+		if decompressed.Names[0] != cert.Names[0] {
+			t.Error("Decompressed certificate name doesn't match original")
+		}
+	})
+	
+	t.Run("CompressionMemoryReduction", func(t *testing.T) {
+		cert := createTestCertificate("memory-test.example.com")
+		originalSize := estimateCertificateMemoryUsage(cert)
+		
+		compressed, err := compressCertificate(cert)
+		if err != nil {
+			t.Fatalf("Failed to compress certificate: %v", err)
+		}
+		
+		compressedSize := compressed.estimateMemoryUsage()
+		
+		// Compressed size should be smaller (expect at least 20% reduction)
+		if compressedSize >= originalSize {
+			t.Errorf("Compressed size (%d) should be smaller than original (%d)", compressedSize, originalSize)
+		}
+		
+		reductionPercent := float64(originalSize-compressedSize) / float64(originalSize) * 100
+		t.Logf("Memory reduction: %.1f%% (original: %d bytes, compressed: %d bytes)", 
+			reductionPercent, originalSize, compressedSize)
+		
+		if reductionPercent < 20 {
+			t.Errorf("Expected at least 20%% memory reduction, got %.1f%%", reductionPercent)
+		}
+	})
+}
+
+func TestCacheWithCompression(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	
+	// Test cache behavior with compression enabled
+	t.Run("CompressedCacheOperations", func(t *testing.T) {
+		opts := CacheOptions{
+			GetConfigForCert: func(cert Certificate) (*Config, error) {
+				return &Config{Logger: logger}, nil
+			},
+			Capacity:         5,
+			MaxMemoryMB:      1,
+			EvictionPolicy:   "lru",
+			EnableCompression: true,
+			Logger:           logger,
+		}
+		cache := NewCache(opts)
+		defer cache.Stop()
+		
+		// Create and cache a certificate
+		cert1 := createTestCertificate("compressed1.example.com")
+		cache.cacheCertificate(cert1)
+		
+		// Verify it's stored in compressed cache
+		if len(cache.compressedCache) != 1 {
+			t.Error("Certificate not stored in compressed cache")
+		}
+		if len(cache.cache) != 0 {
+			t.Error("Certificate should not be in regular cache when compression enabled")
+		}
+		
+		// Retrieve the certificate
+		certs := cache.getAllMatchingCerts("compressed1.example.com")
+		if len(certs) != 1 {
+			t.Fatalf("Expected 1 certificate, got %d", len(certs))
+		}
+		
+		retrievedCert := certs[0]
+		if retrievedCert.Hash() != cert1.Hash() {
+			t.Error("Retrieved certificate hash doesn't match original")
+		}
+		if retrievedCert.Names[0] != cert1.Names[0] {
+			t.Error("Retrieved certificate name doesn't match original")
+		}
+	})
+	
+	t.Run("CompressedCacheEviction", func(t *testing.T) {
+		opts := CacheOptions{
+			GetConfigForCert: func(cert Certificate) (*Config, error) {
+				return &Config{Logger: logger}, nil
+			},
+			Capacity:         2, // Small capacity to trigger eviction
+			MaxMemoryMB:      1,
+			EvictionPolicy:   "lru",
+			EnableCompression: true,
+			Logger:           logger,
+		}
+		cache := NewCache(opts)
+		defer cache.Stop()
+		
+		// Add certificates to reach capacity
+		cert1 := createTestCertificate("evict1.example.com")
+		cert2 := createTestCertificate("evict2.example.com")
+		cert3 := createTestCertificate("evict3.example.com")
+		
+		cache.cacheCertificate(cert1)
+		cache.cacheCertificate(cert2)
+		
+		// Access cert1 to make it more recently used than cert2
+		cache.getAllMatchingCerts("evict1.example.com")
+		
+		// Add cert3, should evict cert2 (least recently used)
+		cache.cacheCertificate(cert3)
+		
+		// Verify cert1 and cert3 are present, cert2 is evicted
+		certs1 := cache.getAllMatchingCerts("evict1.example.com")
+		certs2 := cache.getAllMatchingCerts("evict2.example.com")
+		certs3 := cache.getAllMatchingCerts("evict3.example.com")
+		
+		if len(certs1) != 1 {
+			t.Error("cert1 should still be in cache (recently accessed)")
+		}
+		if len(certs2) != 0 {
+			t.Error("cert2 should be evicted (least recently used)")
+		}
+		if len(certs3) != 1 {
+			t.Error("cert3 should be in cache (just added)")
+		}
+	})
+	
+	t.Run("MixedCacheMode", func(t *testing.T) {
+		// Test that cache works when both compressed and regular certs exist
+		opts := CacheOptions{
+			GetConfigForCert: func(cert Certificate) (*Config, error) {
+				return &Config{Logger: logger}, nil
+			},
+			Capacity:         10,
+			MaxMemoryMB:      5,
+			EvictionPolicy:   "lru",
+			EnableCompression: false, // Start with compression disabled
+			Logger:           logger,
+		}
+		cache := NewCache(opts)
+		defer cache.Stop()
+		
+		// Add a regular certificate
+		cert1 := createTestCertificate("mixed1.example.com")
+		cache.cacheCertificate(cert1)
+		
+		// Enable compression
+		opts.EnableCompression = true
+		cache.SetOptions(opts)
+		
+		// Add a compressed certificate
+		cert2 := createTestCertificate("mixed2.example.com")
+		cache.cacheCertificate(cert2)
+		
+		// Both should be retrievable
+		certs1 := cache.getAllMatchingCerts("mixed1.example.com")
+		certs2 := cache.getAllMatchingCerts("mixed2.example.com")
+		
+		if len(certs1) != 1 {
+			t.Error("Regular certificate should be retrievable")
+		}
+		if len(certs2) != 1 {
+			t.Error("Compressed certificate should be retrievable")
+		}
+		
+		// Verify they're in different caches
+		if len(cache.cache) != 1 {
+			t.Error("Regular cache should have 1 certificate")
+		}
+		if len(cache.compressedCache) != 1 {
+			t.Error("Compressed cache should have 1 certificate")
+		}
+		
+		// Memory stats should count both
+		stats := cache.GetMemoryStats()
+		if stats.CertificateCount != 2 {
+			t.Errorf("Expected total count of 2, got %d", stats.CertificateCount)
+		}
+	})
+}
