@@ -1,0 +1,14 @@
+# test log
+getenv TMPDIR
+open /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T/TestFile2905695347/001/260605224
+stat /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T/TestFile2905695347/001/test-file
+open /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T/TestFile2905695347/001/test-file
+open /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T
+getenv TMPDIR
+open /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T/TestConcurrentWrites50518270/001/2610706999
+open /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T/TestConcurrentWrites50518270/001/1585281037
+stat /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T/TestConcurrentWrites50518270/001/test-file
+open /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T/TestConcurrentWrites50518270/001/test-file
+stat /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T/TestConcurrentWrites50518270/001/test-file
+open /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T/TestConcurrentWrites50518270/001/test-file
+open /var/folders/gx/lzk8ylyx64l2d565y3q98qgr0000gn/T

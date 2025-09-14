@@ -64,9 +64,15 @@ type Cache struct {
 	stopChan chan struct{}
 
 	// Used to signal when stopping is completed
-	doneChan chan struct{}
+    doneChan chan struct{}
 
-	logger *zap.Logger
+    logger *zap.Logger
+
+    // derIntern holds canonical copies of DER-encoded certificate bytes
+    // (typically intermediates) so that identical chains across many
+    // cached certificates share the same backing storage. This reduces
+    // long-lived heap size and fragmentation. Safe for concurrent use.
+    derIntern derIntern
 }
 
 // NewCache returns a new, valid Cache for efficiently
@@ -92,13 +98,14 @@ type Cache struct {
 // is being terminated, so that it can clean up
 // any locks for other processes to unblock!
 func NewCache(opts CacheOptions) *Cache {
-	c := &Cache{
-		cache:      make(map[string]Certificate),
-		cacheIndex: make(map[string][]string),
-		stopChan:   make(chan struct{}),
-		doneChan:   make(chan struct{}),
-		logger:     opts.Logger,
-	}
+    c := &Cache{
+        cache:      make(map[string]Certificate),
+        cacheIndex: make(map[string][]string),
+        stopChan:   make(chan struct{}),
+        doneChan:   make(chan struct{}),
+        logger:     opts.Logger,
+    }
+    c.derIntern.init()
 
 	// absolutely do not allow a nil logger; panics galore
 	if c.logger == nil {
@@ -206,10 +213,21 @@ func (certCache *Cache) cacheCertificate(cert Certificate) {
 // This function is NOT safe for concurrent use. Callers MUST acquire
 // a write lock on certCache.mu first.
 func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
-	// if this certificate already exists in the cache, this is basically
-	// a no-op so we reuse existing cert (prevent duplication), but we do
-	// modify the cert to add tags it may be missing (see issue #211)
-	if existingCert, ok := certCache.cache[cert.hash]; ok {
+    // Before storing the certificate, intern any intermediate DER
+    // slices so that commonly shared intermediates across many
+    // certificates share the same backing storage.
+    if n := len(cert.Certificate.Certificate); n > 1 {
+        chain := cert.Certificate.Certificate
+        for i := 1; i < n; i++ {
+            chain[i] = certCache.derIntern.intern(chain[i])
+        }
+        cert.Certificate.Certificate = chain
+    }
+
+    // if this certificate already exists in the cache, this is basically
+    // a no-op so we reuse existing cert (prevent duplication), but we do
+    // modify the cert to add tags it may be missing (see issue #211)
+    if existingCert, ok := certCache.cache[cert.hash]; ok {
 		logMsg := "certificate already cached"
 
 		if len(cert.Tags) > 0 {
